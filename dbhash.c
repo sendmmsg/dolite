@@ -1,24 +1,3 @@
-/*
-** 2016-06-07
-**
-** The author disclaims copyright to this source code.  In place of
-** a legal notice, here is a blessing:
-**
-**    May you do good and not evil.
-**    May you find forgiveness for yourself and forgive others.
-**    May you share freely, never taking more than you give.
-**
-*************************************************************************
-**
-** This is a utility program that computes an SHA1 hash on the content
-** of an SQLite database.
-**
-** The hash is computed over just the content of the database.  Free
-** space inside of the database file, and alternative on-disk representations
-** of the same content (ex: UTF8 vs UTF16) do not affect the hash.  So,
-** for example, the database file page size, encoding, and auto_vacuum setting
-** can all be changed without changing the hash.
-*/
 #include "sqlite3.h"
 #include <assert.h>
 #include <ctype.h>
@@ -85,7 +64,7 @@ static int hash_one_query(sqlite3 *db, const char *zFormat, ...) {
   sqlite3_stmt *pStmt; /* The query defined by zFormat and "..." */
   int nCol;            /* Number of columns in the result set */
   int i;               /* Loop counter */
-  int rc;
+  int rc = 0;
 
   /* Prepare the query defined by zFormat and "..." */
   va_start(ap, zFormat);
@@ -147,9 +126,34 @@ static int hash_one_query(sqlite3 *db, const char *zFormat, ...) {
     }
   }
   sqlite3_finalize(pStmt);
+  if (rc != 0) {
+    fprintf(stderr, "Hash one query: rc => %d\n", rc);
+  }
   return rc;
 }
 
+int dolite_hash_blob(unsigned char *digest, unsigned char digest_len) {
+  // TODO
+  return -1;
+  crypto_generichash_state blob_hash_state;
+  int rc = crypto_generichash_init(&blob_hash_state, NULL, 0, digest_len);
+  if (rc != 0) {
+    fprintf(stderr, "Error initalizing hash\n");
+    goto done;
+  }
+  /* Hash table content */
+
+  rc = crypto_generichash_update(&hash_state, digest, digest_len);
+  /* Finish and output the hash and close the database connection. */
+  rc = crypto_generichash_final(&hash_state, digest, digest_len);
+  if (rc != 0) {
+    fprintf(stderr, "ERROR finalizing hash\n");
+    goto done;
+  }
+
+done:
+  return -1;
+}
 int dolite_hash_db(sqlite3 *db, unsigned char *digest,
                    unsigned char digest_len) {
 
@@ -157,8 +161,10 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
   memset(digest, 0, digest_len);
   /* Start the hash */
   int rc = crypto_generichash_init(&hash_state, NULL, 0, digest_len);
-  if (rc != 0)
-    goto err;
+  if (rc != 0) {
+    fprintf(stderr, "Error initalizing hash\n");
+    goto done;
+  }
   /* Hash table content */
   pStmt =
       db_prepare(db, "SELECT name FROM sqlite_schema\n"
@@ -174,11 +180,14 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
     ** historical version of SQLite has always output rows in PRIMARY KEY
     ** order when there is no WHERE or GROUP BY clause, so the ORDER BY
     ** can be safely omitted. */
-    printf("    hashing table %s\n", sqlite3_column_text(pStmt, 0));
+    char *column_text = sqlite3_column_text(pStmt, 0);
+    printf("    hashing table %s\n", column_text);
     rc = hash_one_query(db, "SELECT * FROM \"%w\"",
                         sqlite3_column_text(pStmt, 0));
-    if (rc != 0)
-      goto err;
+    if (rc != 0) {
+      fprintf(stderr, "ERROR hashing '%s'\n", column_text);
+      goto done;
+    }
   }
 
   /* Hash the database schema */
@@ -186,19 +195,19 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
       hash_one_query(db, "SELECT type, name, tbl_name, sql FROM sqlite_schema\n"
                          " WHERE tbl_name NOT LIKE 'dolite_%%'\n"
                          " ORDER BY name COLLATE nocase;\n");
-  if (rc != 0)
-    goto err;
+  if (rc != 0) {
+    fprintf(stderr, "ERROR hashing 'sqlite_schema'\n");
+    goto done;
+  }
 
   /* Finish and output the hash and close the database connection. */
   rc = crypto_generichash_final(&hash_state, digest, digest_len);
-  if (rc != 0)
-    goto err;
-  /* for (int i = 0; i < 32; i++) { */
-  /*   printf("%x", digest[i]); */
-  /* } */
-  /* printf("\n"); */
+  if (rc != 0) {
+    fprintf(stderr, "ERROR finalizing hash\n");
+    goto done;
+  }
 
-err:
+done:
   sqlite3_finalize(pStmt);
   if (rc == 0)
     return SQLITE_OK;
