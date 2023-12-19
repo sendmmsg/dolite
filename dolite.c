@@ -473,6 +473,19 @@ int inspect_changeset(int nChangeset, void *pChangeset) {
   sqlite3changeset_finalize(iter);
 }
 
+// TODO
+// dolite_status() -- print changes since last commit
+// dolite_log() -- list dolite_hist table
+// dolite_diff() -- differences between current changes and/or one or more diffs
+// dolite_rebase() -- merge commits
+// dolite_reset() -- return head to particular state
+// dolite_branch() -> any point?
+// dolite_branches -> do we want to keep track of head, branchb, etc ?
+// dolite_merge() -- ??
+// dolite_tag()
+// dolite_sign()
+//
+
 sqlite3_session *dolite_commit(sqlite3 *db, sqlite3_session *session,
                                char *username, char *commit_message) {
 
