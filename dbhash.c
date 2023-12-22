@@ -1,3 +1,4 @@
+#include "dolite.h"
 #include "sqlite3.h"
 #include <assert.h>
 #include <ctype.h>
@@ -35,15 +36,18 @@ static sqlite3_stmt *db_vprepare(sqlite3 *db, const char *zFormat, va_list ap) {
   if (zSql == 0)
     runtimeError("out of memory");
   rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+  /* printf("db_vprepare rc: %s\n", error_names[rc]); */
   if (rc) {
     runtimeError("SQL statement error: %s\n\"%s\"", sqlite3_errmsg(db), zSql);
   }
   sqlite3_free(zSql);
   return pStmt;
 }
+
 static sqlite3_stmt *db_prepare(sqlite3 *db, const char *zFormat, ...) {
   va_list ap;
   sqlite3_stmt *pStmt;
+  /* printf("db_prepare\n"); */
   va_start(ap, zFormat);
   pStmt = db_vprepare(db, zFormat, ap);
   va_end(ap);
@@ -132,9 +136,10 @@ static int hash_one_query(sqlite3 *db, const char *zFormat, ...) {
   return rc;
 }
 
-int dolite_hash_blob(unsigned char *digest, unsigned char digest_len) {
-  // TODO
-  return -1;
+int dolite_hash_blob(unsigned char *digest, int digest_len, void *data,
+                     int data_len) {
+  printf("dolite_hash_blob(%p, %d, %p %d)\n", digest, digest_len, data,
+         data_len);
   crypto_generichash_state blob_hash_state;
   int rc = crypto_generichash_init(&blob_hash_state, NULL, 0, digest_len);
   if (rc != 0) {
@@ -142,21 +147,26 @@ int dolite_hash_blob(unsigned char *digest, unsigned char digest_len) {
     goto done;
   }
   /* Hash table content */
-
-  rc = crypto_generichash_update(&hash_state, digest, digest_len);
-  /* Finish and output the hash and close the database connection. */
-  rc = crypto_generichash_final(&hash_state, digest, digest_len);
+  rc = crypto_generichash_update(&blob_hash_state, data, data_len);
   if (rc != 0) {
-    fprintf(stderr, "ERROR finalizing hash\n");
+    fprintf(stderr, "Error updating hash\n");
+    goto done;
+  }
+  /* Finish and output the hash and close the database connection. */
+  rc = crypto_generichash_final(&blob_hash_state, digest, digest_len);
+  if (rc != 0) {
+    fprintf(stderr, "Error finalizing hash\n");
     goto done;
   }
 
 done:
   return -1;
 }
+
 int dolite_hash_db(sqlite3 *db, unsigned char *digest,
                    unsigned char digest_len) {
 
+  printf("dolite_hash_db\n");
   sqlite3_stmt *pStmt;
   memset(digest, 0, digest_len);
   /* Start the hash */
@@ -167,11 +177,11 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
   }
   /* Hash table content */
   pStmt =
-      db_prepare(db, "SELECT name FROM sqlite_schema\n"
-                     " WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL%%'\n"
-                     "   AND name NOT LIKE 'sqlite_%%'\n"
-                     "   AND name NOT LIKE 'dolite_%%'\n"
-                     " ORDER BY name COLLATE nocase;\n");
+      db_prepare(db, "SELECT name FROM sqlite_schema"
+                     " WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL%%'"
+                     "   AND name NOT LIKE 'sqlite_%%'"
+                     "   AND name NOT LIKE 'dolite_%%'"
+                     " ORDER BY name COLLATE nocase;");
 
   while (SQLITE_ROW == sqlite3_step(pStmt)) {
     /* We want rows of the table to be hashed in PRIMARY KEY order.

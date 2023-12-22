@@ -1,13 +1,15 @@
 #define SQLITE_ENABLE_SNAPSHOT 1
 #define SQLITE_ENABLE_SESSION 1
+#include "dolite.h"
 #include "sqlite3.h"
-//#include "sqlite3ext.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #define DIGEST_BYTES 32
+
+sqlite3_session *pSession = 0;
 unsigned char digest[DIGEST_BYTES];
 void DumpHex(const void *data, size_t size);
 int session_table_filter(void *pctx, const char *table);
@@ -17,45 +19,6 @@ void hash_print(unsigned char *data, size_t length, int pad, char pad_char);
 int dolite_hash_db(sqlite3 *db, unsigned char *digest,
                    unsigned char digest_len);
 char *hash_tostring(unsigned char *data, size_t length, int pad, char pad_char);
-
-static const char *const error_names[] = {
-    [SQLITE_OK] = "SQLITE_OK: Successful result ",
-    [SQLITE_ERROR] = "SQLITE_ERROR: Generic error ",
-    [SQLITE_INTERNAL] = "SQLITE_INTERNAL: Internal logic error in SQLite ",
-    [SQLITE_PERM] = "SQLITE_PERM: Access permission denied ",
-    [SQLITE_ABORT] = "SQLITE_ABORT: Callback routine requested an abort ",
-    [SQLITE_BUSY] = "SQLITE_BUSY: The database file is locked ",
-    [SQLITE_LOCKED] = "SQLITE_LOCKED: A table in the database is locked ",
-    [SQLITE_NOMEM] = "SQLITE_NOMEM: A malloc() failed ",
-    [SQLITE_READONLY] =
-        "SQLITE_READONLY: Attempt to write a readonly database ",
-    [SQLITE_INTERRUPT] =
-        "SQLITE_INTERRUPT: Operation terminated by sqlite3_interrupt()",
-    [SQLITE_IOERR] = "SQLITE_IOERR: Some kind of disk I/O error occurred ",
-    [SQLITE_CORRUPT] = "SQLITE_CORRUPT: The database disk image is malformed ",
-    [SQLITE_NOTFOUND] =
-        "SQLITE_NOTFOUND: Unknown opcode in sqlite3_file_control() ",
-    [SQLITE_FULL] = "SQLITE_FULL: Insertion failed because database is full ",
-    [SQLITE_CANTOPEN] = "SQLITE_CANTOPEN: Unable to open the database file ",
-    [SQLITE_PROTOCOL] = "SQLITE_PROTOCOL: Database lock protocol error ",
-    [SQLITE_EMPTY] = "SQLITE_EMPTY: Internal use only ",
-    [SQLITE_SCHEMA] = "SQLITE_SCHEMA: The database schema changed ",
-    [SQLITE_TOOBIG] = "SQLITE_TOOBIG: String or BLOB exceeds size limit ",
-    [SQLITE_CONSTRAINT] =
-        "SQLITE_CONSTRAINT: Abort due to constraint violation ",
-    [SQLITE_MISMATCH] = "SQLITE_MISMATCH: Data type mismatch ",
-    [SQLITE_MISUSE] = "SQLITE_MISUSE: Library used incorrectly ",
-    [SQLITE_NOLFS] = "SQLITE_NOLFS: Uses OS features not supported on host ",
-    [SQLITE_AUTH] = "SQLITE_AUTH: Authorization denied ",
-    [SQLITE_FORMAT] = "SQLITE_FORMAT: Not used ",
-    [SQLITE_RANGE] =
-        "SQLITE_RANGE: 2nd parameter to sqlite3_bind out of range ",
-    [SQLITE_NOTADB] = "SQLITE_NOTADB: File opened that is not a database file ",
-    [SQLITE_NOTICE] = "SQLITE_NOTICE: Notifications from sqlite3_log() ",
-    [SQLITE_WARNING] = "SQLITE_WARNING: Warnings from sqlite3_log() ",
-    [SQLITE_ROW] = "SQLITE_ROW: sqlite3_step() has another row ready ",
-    [SQLITE_DONE] = "SQLITE_DONE: sqlite3_step() has finished executing ",
-};
 
 static int xConflict(void *pCtx, int eConflict, sqlite3_changeset_iter *pIter) {
   int ret = (int)pCtx;
@@ -164,6 +127,7 @@ sqlite3_session *dolite_init(sqlite3 *db) {
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Error creating dolite_hist table: %s\n", err_msg);
     sqlite3_free(err_msg);
+    sqlite3_close(db);
     return NULL;
   }
   return create_session(db);
@@ -470,7 +434,9 @@ int inspect_changeset(int nChangeset, void *pChangeset) {
       fprintf(stderr, "Error in sqlite3changeset_op(), unknown opcode\n");
     }
   }
+
   sqlite3changeset_finalize(iter);
+  return rc;
 }
 
 // TODO
@@ -485,6 +451,69 @@ int inspect_changeset(int nChangeset, void *pChangeset) {
 // dolite_tag()
 // dolite_sign()
 //
+
+sqlite3_session *dolite_diff(sqlite3 *db, sqlite3_session *session,
+                             char *username) {
+
+  printf("dolite_diff\n");
+
+  int nChangeset;
+  void *pChangeset;
+  int rc = sqlite3session_changeset(session, &nChangeset, &pChangeset);
+  if (rc != SQLITE_OK)
+    exit_with_error(db, "failure fetching changeset: ");
+
+  sqlite3_stmt *stmt;
+  /* int64_t ts_start = clock_usecs(); */
+  rc = sqlite3_prepare_v2(
+      db, "INSERT INTO dolite_diff VALUES (NULL, DATETIME('now'), ?,?,?);", -1,
+      &stmt, 0);
+
+  if (rc != SQLITE_OK)
+    exit_with_error(db, "failure fetching data: ");
+
+  rc = sqlite3_bind_text(stmt, 1, username, strlen(username), NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to bind username: %s\n", sqlite3_errmsg(db));
+    exit(0);
+  }
+
+  dolite_hash_blob(&digest[0], DIGEST_BYTES, pChangeset, nChangeset);
+  char *changeset_hash = hash_tostring(digest, DIGEST_BYTES, 0, 'i');
+  printf("\n\n base64-encoded hash: %s\n\n", changeset_hash);
+
+  rc = sqlite3_bind_text(stmt, 2, changeset_hash, strlen(changeset_hash), NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to bind blob: %s\n", sqlite3_errmsg(db));
+    exit(0);
+  }
+  rc = sqlite3_bind_blob(stmt, 3, pChangeset, nChangeset, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to bind blob: %s\n", sqlite3_errmsg(db));
+    exit(0);
+  }
+
+  /* int64_t ts_stop = clock_usecs(); */
+  /* printf("dolite_commit: compiling SQL and binding took %lu microsecs\n", */
+  /*        ts_stop - ts_start); */
+  rc = sqlite3_step(stmt);
+  int ncols = sqlite3_column_count(stmt);
+  // run the SQL
+  while (rc == SQLITE_ROW) {
+    for (int i = 0; i < ncols; i++) {
+      printf(" --  '%s' ", sqlite3_column_text(stmt, i));
+    }
+
+    printf("\n");
+    rc = sqlite3_step(stmt);
+  }
+  // destroy the object to avoid resource leaks
+  sqlite3_finalize(stmt);
+  sqlite3_free(pChangeset);
+  sqlite3session_delete(session);
+
+  return create_session(db);
+}
 
 sqlite3_session *dolite_commit(sqlite3 *db, sqlite3_session *session,
                                char *username, char *commit_message) {
@@ -609,51 +638,136 @@ void hash_print(unsigned char *data, size_t length, int pad, char pad_char) {
   free(string);
 }
 
+int dolite_open(const char *filename, sqlite3 **ppDb) {
+  char *err_msg = NULL;
+  int rc = sqlite3_open(filename, ppDb);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  char *sql =
+      "CREATE TABLE IF NOT EXISTS dolite_hist(id INTEGER PRIMARY KEY, "
+      "ts DATETIME, User TEXT, Changehash TEXT, Message TEXT, Dbhash "
+      "TEXT, Diff BLOB );"
+      "CREATE TABLE IF NOT EXISTS dolite_diff(id INTEGER PRIMARY KEY, "
+      "ts DATETIME, User TEXT, Changehash TEXT UNIQUE, Changeset BLOB );";
+
+  printf("Creating dolite history table\n");
+  rc = sqlite3_exec(*ppDb, sql, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating dolite_hist table: %s\n", err_msg);
+    goto err;
+  }
+  pSession = create_session(*ppDb);
+  return rc;
+
+err:
+  if (err_msg)
+    sqlite3_free(err_msg);
+  if (ppDb != NULL && *ppDb != NULL)
+    sqlite3_close(*ppDb);
+
+  return rc;
+}
+
+int dolite_merge_diffs(sqlite3 *db) {
+  char *err_msg = NULL;
+  char *sql =
+      "SELECT a.id, b.id, a.changeset, b.changeset FROM dolite_diff AS a LEFT "
+      "JOIN dolite_diff AS b ON b.id = a.id + 1 WHERE b.id IS NOT NULL;";
+  sqlite3_stmt *stmt;
+
+  printf("Creating dolite history table\n");
+  /* int rc = sqlite3_exec(db, sql, 0, 0, &err_msg); */
+  /* if (rc != SQLITE_OK) { */
+  /*   fprintf(stderr, "Error creating dolite_hist table: %s\n", err_msg); */
+  /*   goto err; */
+  /* } */
+
+  int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+  if (rc != SQLITE_OK)
+    exit_with_error(db, "failure fetching data: ");
+
+  // run the SQL
+  rc = sqlite3_step(stmt);
+  int ncols = sqlite3_column_count(stmt);
+  // run the SQL
+  printf("%d\n", rc);
+  while (rc == SQLITE_ROW) {
+    /* for (int i = 0; i < ncols; i++) { */
+    /*   print_stmt_value(stmt, i); */
+    /* } */
+    printf("a: %p (%d), ", sqlite3_column_blob(stmt, 2),
+           sqlite3_column_bytes(stmt, 2));
+    printf("b: %p (%d)\n", sqlite3_column_blob(stmt, 3),
+           sqlite3_column_bytes(stmt, 3));
+
+    int nConcat = 0;
+    void *pConcat = 0;
+    printf("A:\n");
+    inspect_changeset(sqlite3_column_bytes(stmt, 2),
+                      (void *)sqlite3_column_blob(stmt, 2));
+    printf("B:\n");
+    inspect_changeset(sqlite3_column_bytes(stmt, 3),
+                      (void *)sqlite3_column_blob(stmt, 3));
+    rc = sqlite3changeset_concat(
+        sqlite3_column_bytes(stmt, 2), (void *)sqlite3_column_blob(stmt, 2),
+        sqlite3_column_bytes(stmt, 3), (void *)sqlite3_column_blob(stmt, 3),
+        &nConcat, &pConcat);
+    if (rc != SQLITE_ROW) {
+      printf("sqlite3changeset_concat() error %d\n", rc);
+    }
+    printf("C:\n");
+    inspect_changeset(nConcat, pConcat);
+
+    printf("\n");
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW)
+      break;
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW)
+      break;
+  }
+
+  // destroy the object to avoid resource leaks
+  sqlite3_finalize(stmt);
+  return SQLITE_OK;
+err:
+  if (err_msg)
+    sqlite3_free(err_msg);
+  sqlite3_close(db);
+
+  return rc;
+}
+
 int main() {
-  sqlite3 *db;
-
+  sqlite3 *db = 0;
   char *err_msg = 0;
-
-  int rc = sqlite3_open("test.db", &db);
+  int rc = dolite_open("test.db", &db);
 
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
-    sqlite3_close(db);
     return 1;
   }
 
-  printf("first DB hash, empty: \t ");
-  int64_t ts_start = clock_usecs();
+  dolite_merge_diffs(db);
+  return 1;
+
+  printf("first DB hash, empty: %p \t ", db);
   dolite_hash_db(db, &digest[0], DIGEST_BYTES);
   hash_print(digest, DIGEST_BYTES, 0, ';');
-  int64_t ts_stop = clock_usecs();
-  printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start);
-  sqlite3_session *pSession = 0;
   // Start the Session here!
-  pSession = dolite_init(db);
-  if (pSession == NULL) {
-    fprintf(stderr, "Could not create session: %s\n", sqlite3_errmsg(db));
-    sqlite3_close(db);
-    return SQLITE_ERROR;
-  }
-
-  // Do stuff
   rc = create_and_insert(db);
   if (rc != SQLITE_OK) {
-
     fprintf(stderr, "Cannot create table: %s\n", sqlite3_errmsg(db));
     sqlite3_close(db);
-
     return 1;
   }
 
-  printf("added baseline \n");
-  ts_start = clock_usecs();
-  dolite_hash_db(db, &digest[0], DIGEST_BYTES);
-  hash_print(digest, DIGEST_BYTES, 0, ';');
-  ts_stop = clock_usecs();
-  printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start);
-  pSession = dolite_commit(db, pSession, "ponsko", "initial commit");
+  rc = insert_new_car(db, "Ko", 499);
+  /* dolite_hash_db(db, &digest[0], DIGEST_BYTES); */
+  /* hash_print(digest, DIGEST_BYTES, 0, ';'); */
+  // pSession = dolite_commit(db, pSession, "ponsko", "initial commit");
+  pSession = dolite_diff(db, pSession, "ponsko");
   do_select_query(db);
   rc = insert_new_car(db, "Koeningsegg", 19999);
   if (rc != SQLITE_OK) {
@@ -661,22 +775,22 @@ int main() {
     sqlite3_close(db);
     return 1;
   }
-  ts_start = clock_usecs();
+  /* ts_start = clock_usecs(); */
   dolite_hash_db(db, &digest[0], DIGEST_BYTES);
   hash_print(digest, DIGEST_BYTES, 0, ';');
-  ts_stop = clock_usecs();
-  printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start);
+  /* ts_stop = clock_usecs(); */
+  /* printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start); */
   rc = insert_new_car(db, "Volvo", 19999);
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Cannot insert new car: %s\n", sqlite3_errmsg(db));
     sqlite3_close(db);
     return 1;
   }
-  ts_start = clock_usecs();
-  dolite_hash_db(db, &digest[0], DIGEST_BYTES);
-  hash_print(digest, DIGEST_BYTES, 0, ';');
-  ts_stop = clock_usecs();
-  printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start);
+  /* ts_start = clock_usecs(); */
+  /* dolite_hash_db(db, &digest[0], DIGEST_BYTES); */
+  /* hash_print(digest, DIGEST_BYTES, 0, ';'); */
+  /* ts_stop = clock_usecs(); */
+  /* printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start); */
   rc = insert_new_car(db, "Saab", 19999);
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Cannot insert new car: %s\n", sqlite3_errmsg(db));
@@ -684,7 +798,7 @@ int main() {
     return 1;
   }
   printf("added Saab \n");
-  pSession = dolite_commit(db, pSession, "ponsko", "added some cars");
+  pSession = dolite_diff(db, pSession, "ponsko");
   char *errmsg;
   rc = sqlite3_exec(db, "UPDATE Cars SET price = 99999 WHERE Name = 'Volvo';",
                     NULL, NULL, &errmsg);
@@ -702,19 +816,21 @@ int main() {
     return 1;
   }
 
-  pSession = dolite_commit(db, pSession, "ponsko", "removed hummers");
+  rc = insert_new_car(db, "Kovvv", 32499);
+  pSession = dolite_diff(db, pSession, "ponsko");
   /* do_select_query(db); */
   /* printf("Reverting last commit\n"); */
   /* dolite_revert_last_commit(db); */
 
+  rc = insert_new_car(db, "Saabyy", 19999);
   do_select_query(db);
-  pSession = dolite_commit(db, pSession, "ponsko", "returned hummers");
+  pSession = dolite_diff(db, pSession, "ponsko");
 
-  ts_start = clock_usecs();
-  dolite_hash_db(db, &digest[0], DIGEST_BYTES);
-  hash_print(digest, DIGEST_BYTES, 0, ';');
-  ts_stop = clock_usecs();
-  printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start);
+  /* ts_start = clock_usecs(); */
+  /* dolite_hash_db(db, &digest[0], DIGEST_BYTES); */
+  /* hash_print(digest, DIGEST_BYTES, 0, ';'); */
+  /* ts_stop = clock_usecs(); */
+  /* printf("dolite_hash_db: %lu microsecs\n", ts_stop - ts_start); */
 
   printf("Closing session\n");
   sqlite3session_delete(pSession);
