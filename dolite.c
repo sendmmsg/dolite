@@ -79,6 +79,78 @@ int sprint_change_value(sqlite3_value *pValue, char *buf) {
     break;
   }
 }
+static changeset changeset_duplicate(int size, const void *changes) {
+  changeset tmp;
+  tmp.len = size;
+  tmp.data = sqlite3_malloc(size);
+  memcpy(tmp.data, changes, size);
+
+  return tmp;
+}
+static int dolite_merge_staged(sqlite3 *db, char *dbname, changeset *mergeset) {
+  char *err_msg = NULL;
+  char *select_sql = sqlite3_mprintf("SELECT id, diff FROM dolite_%w_staged;", dbname);
+
+  sqlite3_stmt *stmt;
+  changeset in_A = {.len = 0, .data = NULL};
+  changeset in_B = {.len = 0, .data = NULL};
+  changeset result = {.len = 0, .data = NULL};
+
+  int rc = sqlite3_prepare_v2(db, select_sql, -1, &stmt, 0);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "failure preparing statement: %s", select_sql);
+    goto err;
+  }
+
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    /* printf("Nothing in the dolite_diff table\n"); */
+    goto done;
+  }
+  in_A = changeset_duplicate(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
+
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    /* printf("Only one changeset the dolite_diff table, nothing to concaternate\n"); */
+    result = in_A;
+    in_A.data = NULL;
+
+    *mergeset = result;
+    goto done;
+  }
+  in_B = changeset_duplicate(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
+
+  rc = sqlite3changeset_concat(in_A.len, in_A.data, in_B.len, in_B.data, &result.len, &result.data);
+
+  sqlite3_free(in_A.data);
+  sqlite3_free(in_B.data);
+  in_A = result;
+  *mergeset = result;
+
+  rc = sqlite3_step(stmt);
+  while (rc == SQLITE_ROW) {
+    in_B = changeset_duplicate(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
+
+    rc = sqlite3changeset_concat(in_A.len, in_A.data, in_B.len, in_B.data, &result.len, &result.data);
+    // Get more rows to concatenate
+    sqlite3_free(in_A.data);
+    sqlite3_free(in_B.data);
+    in_A = result;
+    *mergeset = result;
+    rc = sqlite3_step(stmt);
+  }
+
+done:
+  // destroy the object to avoid resource leaks
+  sqlite3_finalize(stmt);
+  sqlite3_free(select_sql);
+  return SQLITE_OK;
+err:
+  if (err_msg)
+    sqlite3_free(err_msg);
+  sqlite3_close(db);
+  return rc;
+}
 static int gen_diffstr(char *buffer, int buflen, sqlite3_changeset_iter *iter, int pOp, int pnCol) {
   sqlite3_value *pValue;
   int rc;
@@ -213,12 +285,70 @@ static int doliteConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
   return rc;
 }
 
+// TODO: make this take a variable number of arguments?
 static void dolite_commit(sqlite3_context *context, int argc, sqlite3_value **argv) {
-
+  changeset toinsert = {.data = NULL, .len = 0};
   dolite_vtab *pTab = (dolite_vtab *)sqlite3_user_data(context);
-  char *pOut = sqlite3_mprintf("test ptab %p dbname: %s", pTab, pTab->dbname);
-  sqlite3_result_text(context, pOut, strlen(pOut), sqlite3_free);
+  const unsigned char *username = sqlite3_value_text(argv[0]);
+  const unsigned char *message = sqlite3_value_text(argv[1]);
+
+  dolite_merge_staged(pTab->db, pTab->dbname, &toinsert);
+  if (toinsert.len < 1) {
+    char *pOut = sqlite3_mprintf("dolite_commit: nothing to commit, changeset size: %d", toinsert.len);
+    sqlite3_result_text(context, pOut, strlen(pOut), sqlite3_free);
+    return;
+  }
+
+  sqlite3_stmt *stmt;
+  char *insert_sql = sqlite3_mprintf("INSERT INTO dolite_%w_diff VALUES (NULL, DATETIME('now'), ?);", pTab->dbname);
+  int rc = sqlite3_prepare_v2(pTab->db, insert_sql, -1, &stmt, 0);
+  sqlite3_free(insert_sql);
+
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error preparing dolite_%s_diff statement: %s \n", pTab->dbname, insert_sql);
+    char *pOut = sqlite3_mprintf("dolite_commit: error preparing insert statement: %s", insert_sql);
+    sqlite3_result_text(context, pOut, strlen(pOut), sqlite3_free);
+    return;
+  }
+
+#define DIGEST_BYTES 1024
+  unsigned char digest[DIGEST_BYTES];
+  dolite_hash_blob(&digest[0], DIGEST_BYTES, toinsert.data, toinsert.len);
+  char *changeset_hash = hash_tostring(digest, DIGEST_BYTES, 0, 'i');
+  printf("\n\n base64-encoded hash: %s\n\n", changeset_hash);
+
+  /* rc = sqlite3_bind_text(stmt, 2, changeset_hash, strlen(changeset_hash), NULL); */
+  /* if (rc != SQLITE_OK) { */
+  /*   fprintf(stderr, "Failed to bind blob: %s\n", sqlite3_errmsg(db)); */
+  /*   exit(0); */
+  /* } */
+  rc = sqlite3_bind_blob(stmt, 1, pCur->diff.data, pCur->diff.len, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to bind blob: %s\n", sqlite3_errmsg(p->db));
+    return SQLITE_ERROR;
+  }
+
+  /* int64_t ts_stop = clock_usecs(); */
+  /* printf("dolite_commit: compiling SQL and binding took %lu microsecs\n", */
+  /*        ts_stop - ts_start); */
+  rc = sqlite3_step(stmt);
+  /* int ncols = sqlite3_column_count(stmt); */
+  // run the SQL
+  while (rc == SQLITE_ROW) {
+    /* for (int i = 0; i < ncols; i++) { */
+    /*   printf(" --  '%s' ", sqlite3_column_text(stmt, i)); */
+    /* } */
+
+    /* printf("\n"); */
+    rc = sqlite3_step(stmt);
+  }
+  // destroy the object to avoid resource leaks
+  sqlite3_finalize(stmt);
+  sqlite3_free(pCur->diff.data);
+  sqlite3session_delete(p->session);
+  p->session = create_session(p->db);
 }
+
 static int doliteCreate(sqlite3 *db, void *pAux, int argc, const char *const *argv, sqlite3_vtab **ppVtab,
                         char **pzErr) {
   dolite_vtab *pNew;
@@ -268,7 +398,7 @@ static int doliteCreate(sqlite3 *db, void *pAux, int argc, const char *const *ar
   sqlite3_free(staged_cmd);
   sqlite3_free(diff_cmd);
 
-  rc = sqlite3_create_function(db, "dolite_commit", 1, SQLITE_UTF8 | SQLITE_INNOCUOUS, pNew, dolite_commit, 0, 0);
+  rc = sqlite3_create_function(db, "dolite_commit", 2, SQLITE_UTF8 | SQLITE_INNOCUOUS, pNew, dolite_commit, 0, 0);
 
   return rc;
 }
@@ -288,76 +418,6 @@ static int doliteDestroy(sqlite3_vtab *pVtab) {
   dolite_vtab *p = (dolite_vtab *)pVtab;
   sqlite3_free(p);
   return SQLITE_OK;
-}
-static changeset dupChange(int size, const void *changes) {
-  changeset tmp;
-  tmp.len = size;
-  tmp.data = sqlite3_malloc(size);
-  memcpy(tmp.data, changes, size);
-
-  return tmp;
-}
-static int dolite_merge_staged(sqlite3 *db, char *dbname, changeset *mergeset) {
-  char *err_msg = NULL;
-  char *sql = sqlite3_mprintf("SELECT id, diff FROM dolite_%w_staged;", dbname);
-
-  sqlite3_stmt *stmt;
-  changeset in_A = {.len = 0, .data = NULL};
-  changeset in_B = {.len = 0, .data = NULL};
-  changeset result = {.len = 0, .data = NULL};
-
-  int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
-  if (rc != SQLITE_OK)
-    fprintf(stderr, "failure preparing statement: %s", sql);
-
-  rc = sqlite3_step(stmt);
-  if (rc != SQLITE_ROW) {
-    /* printf("Nothing in the dolite_diff table\n"); */
-    goto done;
-  }
-  in_A = dupChange(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
-
-  rc = sqlite3_step(stmt);
-  if (rc != SQLITE_ROW) {
-    /* printf("Only one changeset the dolite_diff table, nothing to concaternate\n"); */
-    result = in_A;
-    in_A.data = NULL;
-
-    *mergeset = result;
-    goto done;
-  }
-  in_B = dupChange(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
-
-  rc = sqlite3changeset_concat(in_A.len, in_A.data, in_B.len, in_B.data, &result.len, &result.data);
-
-  sqlite3_free(in_A.data);
-  sqlite3_free(in_B.data);
-  in_A = result;
-  *mergeset = result;
-
-  rc = sqlite3_step(stmt);
-  while (rc == SQLITE_ROW) {
-    in_B = dupChange(sqlite3_column_bytes(stmt, 1), sqlite3_column_blob(stmt, 1));
-
-    rc = sqlite3changeset_concat(in_A.len, in_A.data, in_B.len, in_B.data, &result.len, &result.data);
-    // Get more rows to concatenate
-    sqlite3_free(in_A.data);
-    sqlite3_free(in_B.data);
-    in_A = result;
-    *mergeset = result;
-    rc = sqlite3_step(stmt);
-  }
-
-done:
-  // estroy the object to avoid resource leaks
-  sqlite3_finalize(stmt);
-  return SQLITE_OK;
-err:
-  if (err_msg)
-    sqlite3_free(err_msg);
-  sqlite3_close(db);
-
-  return rc;
 }
 /*
 ** Constructor for a new dolite_cursor object.
@@ -385,14 +445,14 @@ static int doliteOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 
     sqlite3_stmt *stmt;
     /* int64_t ts_start = clock_usecs(); */
-    char *st_str = sqlite3_mprintf("INSERT INTO dolite_%w_staged VALUES (NULL, DATETIME('now'), ?);", p->dbname);
-    rc = sqlite3_prepare_v2(p->db, st_str, -1, &stmt, 0);
+    char *insert_sql = sqlite3_mprintf("INSERT INTO dolite_%w_staged VALUES (NULL, DATETIME('now'), ?);", p->dbname);
+    rc = sqlite3_prepare_v2(p->db, insert_sql, -1, &stmt, 0);
 
     if (rc != SQLITE_OK) {
-      fprintf(stderr, "Error preparing dolite_%s_staged statement: %s \n", p->dbname, st_str);
+      fprintf(stderr, "Error preparing dolite_%s_staged statement: %s \n", p->dbname, insert_sql);
       return SQLITE_ERROR;
     }
-    sqlite3_free(st_str);
+    sqlite3_free(insert_sql);
 
     /* dolite_hash_blob(&digest[0], DIGEST_BYTES, pChangeset, nChangeset); */
     /* char *changeset_hash = hash_tostring(digest, DIGEST_BYTES, 0, 'i'); */
@@ -449,6 +509,7 @@ static int doliteClose(sqlite3_vtab_cursor *cur) {
   sqlite3changeset_finalize(pCur->diffiter);
   sqlite3_free(pCur->diff.data);
   sqlite3_free(pCur);
+  fprintf(stderr, "doliteClose, done\n");
   return SQLITE_OK;
 }
 
@@ -642,4 +703,121 @@ __declspec(dllexport)
   fprintf(stderr, "sqlite3_create_module, returned %d \n", rc);
 
   return rc;
+}
+
+static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static size_t b64_encoded_size(size_t inlen) {
+  size_t ret;
+
+  ret = inlen;
+  if (inlen % 3 != 0)
+    ret += 3 - (inlen % 3);
+  ret /= 3;
+  ret *= 4;
+
+  return ret;
+}
+static size_t b64_decoded_size(const char *in) {
+  size_t len;
+  size_t ret;
+  size_t i;
+
+  if (in == NULL)
+    return 0;
+
+  len = strlen(in);
+  ret = len / 4 * 3;
+
+  for (i = len; i-- > 0;) {
+    if (in[i] == '=') {
+      ret--;
+    } else {
+      break;
+    }
+  }
+  return ret;
+}
+static char *b64_encode(const unsigned char *in, size_t len) {
+  char *out;
+  size_t elen;
+  size_t i;
+  size_t j;
+  size_t v;
+
+  if (in == NULL || len == 0)
+    return NULL;
+
+  elen = b64_encoded_size(len);
+  out = sqlite3_malloc(elen + 1);
+  out[elen] = '\0';
+
+  for (i = 0, j = 0; i < len; i += 3, j += 4) {
+    v = in[i];
+    v = i + 1 < len ? v << 8 | in[i + 1] : v << 8;
+    v = i + 2 < len ? v << 8 | in[i + 2] : v << 8;
+
+    out[j] = b64chars[(v >> 18) & 0x3F];
+    out[j + 1] = b64chars[(v >> 12) & 0x3F];
+    if (i + 1 < len) {
+      out[j + 2] = b64chars[(v >> 6) & 0x3F];
+    } else {
+      out[j + 2] = '=';
+    }
+    if (i + 2 < len) {
+      out[j + 3] = b64chars[v & 0x3F];
+    } else {
+      out[j + 3] = '=';
+    }
+  }
+
+  return out;
+}
+static int b64invs[] = {62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1,
+                        -1, -1, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+                        18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28, 29, 30, 31,
+                        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51};
+int b64_isvalidchar(char c) {
+  if (c >= '0' && c <= '9')
+    return 1;
+  if (c >= 'A' && c <= 'Z')
+    return 1;
+  if (c >= 'a' && c <= 'z')
+    return 1;
+  if (c == '+' || c == '/' || c == '=')
+    return 1;
+  return 0;
+}
+static int b64_decode(const char *in, unsigned char *out, size_t outlen) {
+  size_t len;
+  size_t i;
+  size_t j;
+  int v;
+
+  if (in == NULL || out == NULL)
+    return 0;
+
+  len = strlen(in);
+  if (outlen < b64_decoded_size(in) || len % 4 != 0)
+    return 0;
+
+  for (i = 0; i < len; i++) {
+    if (!b64_isvalidchar(in[i])) {
+      return 0;
+    }
+  }
+
+  for (i = 0, j = 0; i < len; i += 4, j += 3) {
+    v = b64invs[in[i] - 43];
+    v = (v << 6) | b64invs[in[i + 1] - 43];
+    v = in[i + 2] == '=' ? v << 6 : (v << 6) | b64invs[in[i + 2] - 43];
+    v = in[i + 3] == '=' ? v << 6 : (v << 6) | b64invs[in[i + 3] - 43];
+
+    out[j] = (v >> 16) & 0xFF;
+    if (in[i + 2] != '=')
+      out[j + 1] = (v >> 8) & 0xFF;
+    if (in[i + 3] != '=')
+      out[j + 2] = v & 0xFF;
+  }
+
+  return 1;
 }
