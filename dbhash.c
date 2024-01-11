@@ -136,10 +136,9 @@ static int hash_one_query(sqlite3 *db, const char *zFormat, ...) {
   return rc;
 }
 
-int dolite_hash_blob(unsigned char *digest, int digest_len, void *data,
-                     int data_len) {
-  printf("dolite_hash_blob(%p, %d, %p %d)\n", digest, digest_len, data,
-         data_len);
+int dolite_hash_blob(unsigned char *digest, int digest_len, void *data, int data_len) {
+  /* printf("dolite_hash_blob(%p, %d, %p %d)\n", digest, digest_len, data, */
+  /*        data_len); */
   crypto_generichash_state blob_hash_state;
   int rc = crypto_generichash_init(&blob_hash_state, NULL, 0, digest_len);
   if (rc != 0) {
@@ -163,8 +162,7 @@ done:
   return -1;
 }
 
-int dolite_hash_db(sqlite3 *db, unsigned char *digest,
-                   unsigned char digest_len) {
+int dolite_hash_db(sqlite3 *db, unsigned char *digest, unsigned char digest_len) {
 
   printf("dolite_hash_db\n");
   sqlite3_stmt *pStmt;
@@ -176,12 +174,11 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
     goto done;
   }
   /* Hash table content */
-  pStmt =
-      db_prepare(db, "SELECT name FROM sqlite_schema"
-                     " WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL%%'"
-                     "   AND name NOT LIKE 'sqlite_%%'"
-                     "   AND name NOT LIKE 'dolite_%%'"
-                     " ORDER BY name COLLATE nocase;");
+  pStmt = db_prepare(db, "SELECT name FROM sqlite_schema"
+                         " WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL%%'"
+                         "   AND name NOT LIKE 'sqlite_%%'"
+                         "   AND name NOT LIKE 'dolite_%%'"
+                         " ORDER BY name COLLATE nocase;");
 
   while (SQLITE_ROW == sqlite3_step(pStmt)) {
     /* We want rows of the table to be hashed in PRIMARY KEY order.
@@ -192,8 +189,7 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
     ** can be safely omitted. */
     char *column_text = sqlite3_column_text(pStmt, 0);
     printf("    hashing table %s\n", column_text);
-    rc = hash_one_query(db, "SELECT * FROM \"%w\"",
-                        sqlite3_column_text(pStmt, 0));
+    rc = hash_one_query(db, "SELECT * FROM \"%w\"", sqlite3_column_text(pStmt, 0));
     if (rc != 0) {
       fprintf(stderr, "ERROR hashing '%s'\n", column_text);
       goto done;
@@ -201,10 +197,9 @@ int dolite_hash_db(sqlite3 *db, unsigned char *digest,
   }
 
   /* Hash the database schema */
-  rc =
-      hash_one_query(db, "SELECT type, name, tbl_name, sql FROM sqlite_schema\n"
-                         " WHERE tbl_name NOT LIKE 'dolite_%%'\n"
-                         " ORDER BY name COLLATE nocase;\n");
+  rc = hash_one_query(db, "SELECT type, name, tbl_name, sql FROM sqlite_schema\n"
+                          " WHERE tbl_name NOT LIKE 'dolite_%%'\n"
+                          " ORDER BY name COLLATE nocase;\n");
   if (rc != 0) {
     fprintf(stderr, "ERROR hashing 'sqlite_schema'\n");
     goto done;
