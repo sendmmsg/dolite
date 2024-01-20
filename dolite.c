@@ -25,12 +25,16 @@ SQLITE_EXTENSION_INIT1
 #include <string.h>
 #define DIGEST_BYTES 32
 
-const char *create_changes_sql = "CREATE TABLE %w_changes ("
-                                 "id INTEGER PRIMARY KEY,"
-                                 "operation TEXT,"
-                                 "indirect INTEGER,"
-                                 "tab TEXT,"
-                                 "diff TEXT);";
+const char *create_dolite_config_sql = "CREATE TABLE dolite_config ("
+                                       "id INTEGER PRIMARY KEY,"
+                                       "key TEXT,"
+                                       "value TEXT);";
+const char *create_v_changes_sql = "CREATE TABLE %w_changes ("
+                                   "id INTEGER PRIMARY KEY,"
+                                   "operation TEXT,"
+                                   "indirect INTEGER,"
+                                   "tab TEXT,"
+                                   "diff TEXT);";
 const char *create_staged_sql = "CREATE TABLE %w_staged ("
                                 "id INTEGER PRIMARY KEY,"
                                 "ts DATETIME,"
@@ -49,12 +53,12 @@ const char *create_commits_sql = "CREATE TABLE %w_commits ("
 const char *create_branches_sql = "CREATE TABLE %w_branches ("
                                   "branch TEXT PRIMARY KEY,"
                                   "hash TEXT);";
-const char *create_logs_sql = "CREATE TABLE %w_logs ("
-                              "id INTEGER PRIMARY KEY,"
-                              "ts DATETIME,"
-                              "user TEXT,"
-                              "message TEXT,"
-                              "hash TEXT);";
+const char *create_v_logs_sql = "CREATE TABLE %w_logs ("
+                                "id INTEGER PRIMARY KEY,"
+                                "ts DATETIME,"
+                                "user TEXT,"
+                                "message TEXT,"
+                                "hash TEXT);";
 const char *cte_commits_sql = "WITH RECURSIVE cte_commits (id, hash, parent) AS ("
                               "SELECT e.id, e.hash, e.parent "
                               "FROM %w_commits e "
@@ -229,55 +233,100 @@ static int gen_diffstr(char *buffer, int buflen, sqlite3_changeset_iter *iter, i
   }
   return SQLITE_ERROR;
 }
+
+// Caller must free return if != NULL
+static char *dolite_config_get(sqlite3 *db, char *key) {
+  sqlite3_stmt *stmt;
+  char *get_key_sql = sqlite3_mprintf("SELECT value FROM dolite_config WHERE key = '%w';", key);
+  fprintf(stderr, "dolite_config_get: get_key_sql %s\n", get_key_sql);
+  char *key_value = 0;
+  int rc = sqlite3_prepare_v2(db, get_key_sql, -1, &stmt, 0);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "dolite_config_get: failed to prepare %s\n", sqlite3_errmsg(db));
+  }
+  assert(rc == SQLITE_OK);
+
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    fprintf(stderr, "dolite_config_get: no_rows!\n");
+    goto done;
+  }
+  char *res = (char *)sqlite3_column_text(stmt, 0);
+  fprintf(stderr, "dolite_config_get: key_value => %s\n", res);
+  if (res != NULL)
+    key_value = sqlite3_mprintf("%w", res);
+
+done:
+  sqlite3_finalize(stmt);
+  sqlite3_free(get_key_sql);
+
+  return key_value;
+}
 static int session_table_filter(void *pctx, const char *table) {
-  if (strncmp(table, "dolite_", strlen("dolite_")) == 0) {
-    printf("session_table_filter: NOT tracking changes to: %s\n", table);
-    return 0;
+  sqlite3 *db = (sqlite3 *)pctx;
+  int is_in_ignore = 0;
+  char *dbname = dolite_config_get(db, "DBNAME");
+  fprintf(stderr, "dolite_config_get('DBNAME') returned -> %s\n", dbname);
+  if (dbname == NULL)
+    goto clean_dbname;
+
+  char *is_in_ignore_sql = sqlite3_mprintf("SELECT count(*) FROM %w_ignore WHERE mtab = '%w';", dbname, table);
+  fprintf(stderr, "dolite_config_get: SQL %s", is_in_ignore_sql);
+  if (is_in_ignore_sql == NULL)
+    goto clean_sql;
+
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_prepare_v2(db, is_in_ignore_sql, -1, &stmt, 0);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "session_table_filter: failed to prepare %s\n", sqlite3_errmsg(db));
+    goto clean_stmt;
+  }
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    fprintf(stderr, "session_table_filter: failed to obtain value %s\n", sqlite3_errmsg(db));
   }
 
-  printf("session_table_filter: tracking changes to: %s\n", table);
+  is_in_ignore = sqlite3_column_int64(stmt, 0);
+  fprintf(stderr, "dolite_config_get: is_in_igonore %d", is_in_ignore);
+
+clean_stmt:
+  sqlite3_finalize(stmt);
+clean_sql:
+  sqlite3_free(is_in_ignore_sql);
+clean_dbname:
+  sqlite3_free(dbname);
+
+  fprintf(stderr, "session_table_filter: tracking changes to: %s, retval: %d \n", table, is_in_ignore);
+  if (is_in_ignore)
+    return 0;
+
   return 1;
 }
 
 static sqlite3_session *create_session(sqlite3 *db) {
-  /* printf("Creating Session\n"); */
   sqlite3_session *session = 0;
-  // TODO: "main" should be created from argv[1] or something similar
   int rc = sqlite3session_create(db, "main", &session);
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Could not create session: %s\n", sqlite3_errmsg(db));
-    sqlite3_close(db);
-    return NULL;
   }
-  /* printf("object config\n"); */
+  assert(rc == SQLITE_OK);
   int val = 1;
   rc = sqlite3session_object_config(session, SQLITE_SESSION_OBJCONFIG_ROWID, &val);
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Error configuring Session for non-rowid tables: rc: %d,  %s (dolite.so linked correctly?)\n", rc,
             sqlite3_errmsg(db));
-
-    /* sqlite3_close(db); */
-    /* return NULL; */
   }
   assert(rc == SQLITE_OK);
-  /* printf("attach\n"); */
   rc = sqlite3session_attach(session, NULL);
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Could not attach 'ALL' to session: %s\n", sqlite3_errmsg(db));
-    sqlite3_close(db);
-    return NULL;
   }
-  /* printf("setting filter\n"); */
-  sqlite3session_table_filter(session, session_table_filter, NULL);
+  assert(rc == SQLITE_OK);
+  sqlite3session_table_filter(session, session_table_filter, db);
 
-  /* printf("Checking session status\n"); */
   rc = sqlite3session_enable(session, -1);
   assert(rc == 1);
-  /* if (rc == 1) { */
-  /*   fprintf(stderr, "  Session enabled\n"); */
-  /* } else if (rc == 0) { */
-  /*   fprintf(stderr, "  Session disabled\n"); */
-  /* } */
 
   return session;
 }
@@ -288,7 +337,6 @@ static void dolite_clean_staged(sqlite3 *db, char *dbname) {
   int rc = sqlite3_prepare_v2(db, delete_from_sql, -1, &stmt, 0);
 
   if (rc != SQLITE_OK) {
-    const char *err_msg = sqlite3_errmsg(db);
     fprintf(stderr, "dolite_clean_staged: failed to prepare %s\n", sqlite3_errmsg(db));
   }
   sqlite3_free(delete_from_sql);
@@ -357,7 +405,7 @@ static char *dolite_commit(sqlite3 *db, sqlite3_session **session, char *dbname,
   }
 
   // Insert in _diffs
-  char *insert_sql = sqlite3_mprintf("INSERT INTO %w_commits VALUES (NULL, DATETIME('now'), ?, ?, ?, ?);", dbname);
+  char *insert_sql = sqlite3_mprintf("INSERT INTO %w_commits VALUES (NULL, DATETIME('now'), ?, ?, ?, ?, ?);", dbname);
   int rc = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, 0);
 
   if (rc != SQLITE_OK) {
@@ -442,33 +490,82 @@ static int dolite_changes_Connect(sqlite3 *db, void *pAux, int argc, const char 
   }
   return rc;
 }
-static int create_all_tables() {}
+static int create_all_tables(sqlite3 *db, const char *dbname) {
+  char *err_msg = 0;
+  char *staged_cmd = sqlite3_mprintf(create_staged_sql, dbname);
+  char *commits_cmd = sqlite3_mprintf(create_commits_sql, dbname);
+  char *branch_cmd = sqlite3_mprintf(create_branches_sql, dbname);
+  char *ignore_cmd = sqlite3_mprintf(create_ignore_sql, dbname);
+  char *config_cmd = sqlite3_mprintf(create_dolite_config_sql, dbname);
 
+  int rc = sqlite3_exec(db, config_cmd, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating table dolite_config table on %s: %s\n", dbname, err_msg);
+    goto done;
+  }
+  rc = sqlite3_exec(db, staged_cmd, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating table %s_staged table: %s\n", dbname, err_msg);
+    goto done;
+  }
+
+  rc = sqlite3_exec(db, commits_cmd, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating table %s_commits table: %s\n", dbname, err_msg);
+    goto done;
+  }
+
+  rc = sqlite3_exec(db, branch_cmd, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating table %s_branch table: %s\n", dbname, err_msg);
+    goto done;
+  }
+  rc = sqlite3_exec(db, ignore_cmd, 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error creating table %s_ignore table: %s\n", dbname, err_msg);
+    goto done;
+  }
+  char *tables[] = {sqlite3_mprintf("%w_staged", dbname),   sqlite3_mprintf("%w_ignore", dbname),
+                    sqlite3_mprintf("%w_branches", dbname), sqlite3_mprintf("%w_commits", dbname),
+                    sqlite3_mprintf("dolite_config"),       NULL};
+
+  int i = 0;
+  char *table = tables[i];
+  while (table != NULL) {
+    char *cmd = sqlite3_mprintf("INSERT INTO %w_ignore VALUES (NULL, '%w');", dbname, table);
+    rc = sqlite3_exec(db, cmd, 0, 0, &err_msg);
+    sqlite3_free(cmd);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Error adding table to %s_ignore table: %s\n", dbname, err_msg);
+      goto done;
+    }
+    sqlite3_free(table);
+    table = tables[++i];
+  }
+
+  char *cmd = sqlite3_mprintf("INSERT INTO dolite_config VALUES (NULL, 'DBNAME', '%w');", dbname);
+  rc = sqlite3_exec(db, cmd, 0, 0, &err_msg);
+  sqlite3_free(cmd);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Error setting 'DBNAME' configuration in dolite_config: %s\n", dbname, err_msg);
+    goto done;
+  }
+
+done:
+  sqlite3_free(staged_cmd);
+  sqlite3_free(commits_cmd);
+  sqlite3_free(branch_cmd);
+  sqlite3_free(ignore_cmd);
+  return rc;
+}
 static int dolite_changes_Create(sqlite3 *db, void *pAux, int argc, const char *const *argv, sqlite3_vtab **ppVtab,
                                  char **pzErr) {
   dolite_vtab *pNew;
   int rc;
   char *err_msg = 0;
   /* fprintf(stderr, "doliteCreate\n"); */
-
-  char *vtab_changes_cmd = sqlite3_mprintf(create_changes_sql, argv[2]);
-  char *staged_cmd = sqlite3_mprintf(create_staged_sql, argv[2]);
-  rc = sqlite3_exec(db, staged_cmd, 0, 0, &err_msg);
-  if (rc != SQLITE_OK) {
-    fprintf(stderr, "Error creating table %s_staged table: %s\n", argv[2], err_msg);
-  }
-  char *diff_cmd = sqlite3_mprintf(create_commits_sql, argv[2]);
-
-  rc = sqlite3_exec(db, diff_cmd, 0, 0, &err_msg);
-  if (rc != SQLITE_OK) {
-    fprintf(stderr, "Error creating table %s_diffs table: %s\n", argv[2], err_msg);
-  }
-  char *branch_cmd = sqlite3_mprintf(create_branches_sql, argv[2]);
-
-  rc = sqlite3_exec(db, branch_cmd, 0, 0, &err_msg);
-  if (rc != SQLITE_OK) {
-    fprintf(stderr, "Error creating table %s_branch table: %s\n", argv[2], err_msg);
-  }
+  create_all_tables(db, argv[2]);
+  char *vtab_changes_cmd = sqlite3_mprintf(create_v_changes_sql, argv[2]);
   rc = sqlite3_declare_vtab(db, vtab_changes_cmd);
 
   /*   /\* For convenience, define symbolic names for the index to each column. *\/ */
@@ -490,8 +587,6 @@ static int dolite_changes_Create(sqlite3 *db, void *pAux, int argc, const char *
   }
   // TODO: handle all resources correctly
   sqlite3_free(vtab_changes_cmd);
-  sqlite3_free(staged_cmd);
-  sqlite3_free(diff_cmd);
 
   return rc;
 }
